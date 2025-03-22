@@ -1,143 +1,86 @@
+import random
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import logging
-import sqlite3
-import os
+
+TERMOS_DE_BUSCA = [
+    'notebook', 'smartphone', 'tv', 'fone de ouvido', 'câmera', 
+    'geladeira', 'microondas', 'videogame', 'tablet', 'impressora'
+]
 
 def extract_data():
-    logging.info("Iniciando extração de dados da API do Mercado Livre...")
+    logging.info("Iniciando extração de dados da API do Mercado Livre.")
 
     ACCESS_TOKEN = Variable.get("ACCESS_TOKEN", default_var=None)
     if not ACCESS_TOKEN:
-        logging.error("ACCESS_TOKEN não encontrado. Execute `get_access_token_dag` antes.")
         raise Exception("ACCESS_TOKEN não encontrado. Execute `get_access_token_dag` antes.")
+
+    termo_busca = random.choice(TERMOS_DE_BUSCA)
+    logging.info(f"Termo de busca selecionado: {termo_busca}")
 
     url = "https://api.mercadolibre.com/sites/MLB/search"
     params = {
-        'q': 'notebook',
+        'q': termo_busca,
         'access_token': ACCESS_TOKEN
     }
-
-    logging.info(f"URL da requisição: {url}")
-    logging.info(f"Parâmetros da requisição: {params}")
 
     try:
         response = requests.get(url, params=params)
         response.raise_for_status()
         data = response.json()
 
-        logging.info("Resposta da API recebida com sucesso.")
-        logging.info(f"Resposta da API: {data}")
-
-        if 'results' not in data:
-            logging.error(f"Resposta inesperada da API: {data}")
-            raise Exception("Erro na API: 'results' não encontrado no JSON.")
-
-        if not isinstance(data['results'], list):
-            logging.error(f"Resposta inesperada da API: {data}")
-            raise Exception("A chave 'results' não contém uma lista válida.")
+        if 'results' not in data or not isinstance(data['results'], list):
+            raise Exception("Resposta da API inválida: 'results' não encontrado ou não é uma lista.")
 
         df = pd.DataFrame(data['results'])
-        logging.info(f"DataFrame criado com {len(df)} registros.")
-        logging.info(f"Colunas disponíveis no DataFrame: {df.columns.tolist()}")  # Log das colunas
 
-        colunas_desejadas = ['id', 'title', 'price', 'sold_quantity', 'condition', 'thumbnail']
-        colunas_disponiveis = [col for col in colunas_desejadas if col in df.columns]
+        colunas_desejadas = ['id', 'title', 'price', 'condition', 'thumbnail']
+        df = df[df.columns.intersection(colunas_desejadas)]
 
-        if not colunas_disponiveis:
-            logging.error("Nenhuma das colunas desejadas está disponível na resposta da API.")
-            raise Exception("Nenhuma das colunas desejadas está disponível na resposta da API.")
+        if df.empty:
+            raise Exception("Nenhuma coluna desejada encontrada na resposta da API.")
 
-        logging.info(f"Colunas disponíveis: {colunas_disponiveis}")
+        hook = PostgresHook(postgres_conn_id='postgres_default', timeout=10)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
 
-        caminho_csv = "/usr/local/airflow/dags/mercado_livre_data.csv"
-        df[colunas_disponiveis].to_csv(caminho_csv, index=False)
-        logging.info(f"Arquivo CSV salvo em {caminho_csv} com {len(df)} registros.")
-        print("Dados extraídos e salvos em CSV.")
+        cursor.execute("SELECT id FROM Produtos;")
+        ids_existentes = {row[0] for row in cursor.fetchall()}
+
+        df_novos_produtos = df[~df['id'].isin(ids_existentes)]
+
+        if not df_novos_produtos.empty:
+            for _, row in df_novos_produtos.iterrows():
+                cursor.execute(
+                    """
+                    INSERT INTO Produtos (id, title, price, condition, thumbnail)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING;
+                    """,
+                    (row['id'], row['title'], row['price'], row['condition'], row['thumbnail'])
+                )
+            conn.commit()
+            logging.info(f"{len(df_novos_produtos)} novos produtos inseridos no banco de dados.")
+        else:
+            logging.info("Nenhum novo produto encontrado para inserção.")
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Erro na requisição à API: {e}")
-        raise Exception(f"Erro na requisição à API: {e}")
+        raise
     except Exception as e:
         logging.error(f"Erro inesperado: {e}")
-        raise Exception(f"Erro inesperado: {e}")
-
-def load_data():
-    logging.info("Iniciando carregamento de dados no banco de dados...")
-
-    # Caminho do arquivo CSV
-    caminho_csv = "/usr/local/airflow/dags/mercado_livre_data.csv"
-
-    # Verifica se o arquivo CSV existe
-    if not os.path.exists(caminho_csv):
-        logging.error(f"Arquivo CSV não encontrado: {caminho_csv}")
-        raise FileNotFoundError(f"Arquivo CSV não encontrado: {caminho_csv}")
-
-    # Caminho do banco de dados SQLite
-    data_folder = 'data'
-    db_path = os.path.join(data_folder, 'mercado_livre.db')
-
-    # Cria o diretório 'data' se não existir
-    if not os.path.exists(data_folder):
-        os.makedirs(data_folder)
-        logging.info(f"Diretório '{data_folder}' criado com sucesso.")
-
-    try:
-        # Conecta ao banco de dados SQLite (ou cria se não existir)
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        logging.info(f"Conectado ao banco de dados: {db_path}")
-
-        # Cria a tabela se não existir
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS Produtos (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            price REAL,
-            condition TEXT,
-            thumbnail TEXT
-        )
-        """
-        cursor.execute(create_table_query)
-        conn.commit()
-        logging.info("Tabela 'Produtos' criada ou verificada com sucesso.")
-        logging.info("Commit realizado com sucesso.")
-
-        df = pd.read_csv(caminho_csv)
-        logging.info(f"Arquivo CSV lido com {len(df)} registros.")
-
-        # Insere os dados no banco de dados
-        for index, row in df.iterrows():
-            insert_query = """
-            INSERT OR IGNORE INTO Produtos (id, title, price, condition, thumbnail)
-            VALUES (?, ?, ?, ?, ?)
-            """
-            try:
-                cursor.execute(insert_query, (
-                    row['id'], row['title'], row['price'], row['condition'], row['thumbnail']
-                ))
-            except sqlite3.IntegrityError:
-                logging.warning(f"Registro duplicado ignorado: ID {row['id']}")
-            except Exception as e:
-                logging.error(f"Erro ao inserir registro {row['id']}: {e}")
-
-        conn.commit()
-        logging.info(f"Dados carregados no banco de dados com sucesso. Total de registros: {len(df)}")
-
-    except sqlite3.Error as e:
-        logging.error(f"Erro ao conectar ou executar consulta no SQLite: {e}")
-        raise Exception(f"Erro no banco de dados: {e}")
-    except Exception as e:
-        logging.error(f"Erro inesperado: {e}")
-        raise Exception(f"Erro inesperado: {e}")
+        raise
     finally:
-        if conn:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
             conn.close()
-            logging.info("Conexão com o banco de dados fechada.")
+        logging.info("Conexão com o banco de dados fechada.")
 
 default_args = {
     'owner': 'airflow',
@@ -151,7 +94,7 @@ default_args = {
 dag = DAG(
     'extract_data_dag',
     default_args=default_args,
-    description='Pipeline para extrair dados do Mercado Livre e carregar no SQLite',
+    description='Pipeline para extrair dados do Mercado Livre e carregar no PostgreSQL',
     schedule_interval='@daily',
 )
 
@@ -161,10 +104,4 @@ task_extract_data = PythonOperator(
     dag=dag,
 )
 
-task_load_data = PythonOperator(
-    task_id='load_data',
-    python_callable=load_data,
-    dag=dag,
-)
-
-task_extract_data >> task_load_data
+task_extract_data
